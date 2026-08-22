@@ -55,7 +55,7 @@ describe("POST /api/rebuild-from-docker", () => {
         await registerReconcilerRoutes(app);
       },
     });
-  }, 60000);
+  }, 12000);
 
   afterAll(async () => {
     if (app) await app.close();

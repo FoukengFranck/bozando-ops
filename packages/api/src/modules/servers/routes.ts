@@ -124,20 +124,26 @@ export async function registerServersRoutes(app: FastifyInstance) {
         if (!target)
           return reply.code(404).send({ error: "cluster introuvable" });
         if (target.status !== "ready") {
-          return reply
-            .code(409)
-            .send({
-              error: `cluster "${target.name}" pas encore prêt (statut: ${target.status})`,
-            });
+          return reply.code(409).send({
+            error: `cluster "${target.name}" pas encore prêt (statut: ${target.status})`,
+          });
         }
         clusterId = body.clusterId;
         role = body.role ?? "worker";
       } else {
-        const cluster = await clusterService.createPending(
-          body.newClusterName!,
-        );
-        clusterId = cluster.id;
-        role = "manager";
+        try {
+          const cluster = await clusterService.createPending(
+            body.newClusterName!,
+          );
+          clusterId = cluster.id;
+          role = "manager";
+        } catch (err) {
+          const status =
+            (err as Error & { statusCode?: number }).statusCode ?? 500;
+          return reply
+            .code(status)
+            .send({ error: err instanceof Error ? err.message : String(err) });
+        }
       }
       const server = await serversService.create({
         name,

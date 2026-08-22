@@ -1,7 +1,7 @@
 import { prisma } from "../../lib/prisma";
 import { eventBus } from "../../lib/event-bus";
 
-export type ClusterStatus = "pending" | "ready" | "failed"
+export type ClusterStatus = "pending" | "ready" | "failed";
 
 /**
  * Se module porte tout la logique métier de l'entité cluster
@@ -43,7 +43,24 @@ export class ClusterService {
    * Démarrage de la creation d'un nouveau cluster-etat "pending" tant que le
    * provisioning de son 1er manager n'est pas terminé
    */
-  createPending(name: string) {
+  async createPending(name: string) {
+    const existing = await prisma.cluster.findUnique({ where: { name } });
+    if (existing) {
+      if (existing.status === "ready") {
+        const err = new Error(
+          `un cluster nommé "${name}" existe déjà et est opérationnel — choisis un autre nom`,
+        );
+        (err as Error & { statusCode?: number }).statusCode = 409;
+        throw err;
+      }
+      return prisma.$transaction(async (tx) => {
+        await tx.server.deleteMany({ where: { clusterId: existing.id } });
+        await tx.cluster.delete({ where: { id: existing.id } });
+        return tx.cluster.create({
+          data: { name, dockerHost: "", caddyAdminUrl: "", status: "pending" },
+        });
+      });
+    }
     return prisma.cluster.create({
       data: { name, dockerHost: "", caddyAdminUrl: "", status: "pending" },
     });
@@ -103,12 +120,22 @@ export class ClusterService {
       (err as Error & { statusCode?: number }).statusCode = 409;
       throw err;
     }
-    const removedServers = await prisma.server.count({
-      where: { clusterId: id },
+    if (cluster.isDefault) {
+      const err = new Error(
+        "le cluster par défaut ne peut jamais être supprimé",
+      );
+      (err as Error & { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    return prisma.$transaction(async (tx) => {
+      const { count: removedServers } = await tx.server.deleteMany({
+        where: { clusterId: id },
+      });
+      await tx.cluster.delete({ where: { id } });
+      return { removedServers };
     });
-    await prisma.cluster.delete({ where: { id } });
-    return { removedServers };
   }
 }
 
-export const clusterService = new ClusterService()
+export const clusterService = new ClusterService();

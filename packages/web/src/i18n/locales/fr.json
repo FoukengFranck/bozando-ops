@@ -2,6 +2,7 @@
   "common": {
     "save": "Enregistrer",
     "cancel": "Annuler",
+    "close": "Fermer",
     "loading": "Chargement...",
     "error": "Erreur",
     "success": "Succès",
@@ -226,15 +227,28 @@
     },
     "badge": { "default": "défaut" },
     "serverCount": "{{count}} serveur(s)",
-    "actions": { "delete": "Supprimer" },
+    "actions": { "create": "Nouveau cluster", "delete": "Supprimer" },
     "deleteConfirm": {
       "title": "Supprimer ce cluster ?",
       "description": "« {{name}} » n'est pas opérationnel (statut : {{status}}) — la suppression retire aussi tout serveur qui lui serait rattaché. Action irréversible."
     },
     "toast": {
+      "creationStarted": "Provisionnement démarré",
       "deleteSuccess": "Cluster supprimé",
       "deleteSuccessWithServers_one": "Cluster supprimé ({{count}} serveur retiré)",
       "deleteSuccessWithServers_other": "Cluster supprimé ({{count}} serveurs retirés)"
+    },
+    "createModal": {
+      "title": "Nouveau cluster",
+      "clusterNameLabel": "Nom du cluster",
+      "hint": "Le premier serveur ajouté devient le manager de ce cluster.",
+      "serverNameLabel": "Nom du serveur",
+      "hostLabel": "Hôte / IP",
+      "portLabel": "Port SSH",
+      "userLabel": "Utilisateur SSH",
+      "authMethodLabel": "Méthode d'authentification",
+      "sshKey": "Clé privée SSH",
+      "password": "Mot de passe"
     },
     "detail": {
       "back": "Retour",
