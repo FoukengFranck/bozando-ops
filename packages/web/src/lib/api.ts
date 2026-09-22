@@ -1,4 +1,5 @@
 import type { Project, ProjectGraph, NodeType, Node, DatabaseConfig } from "@hullbay/shared";
+import i18n from "../i18n/config";
 
 /**
  * base64 UTF-8-safe d'un brouillon de config (query GET). `btoa` brut jette une
@@ -33,6 +34,8 @@ export type ApiError = Error & {
   status?: number
   code?: string
   details?: unknown
+  /** Secondes avant une nouvelle tentative possible (réponse 429). */
+  retryAfterSec?: number
 }
 
 function createApiError(message: string, status: number, code?: string, details?: unknown): ApiError {
@@ -44,14 +47,30 @@ function createApiError(message: string, status: number, code?: string, details?
 }
 
 /**
+ * Traduit un code d'erreur backend stable via la table `apiErrors.*` des locales.
+ * Renvoie null si le code est absent ou non traduit (le message backend sert
+ * alors de repli). Les messages backend sont en français (langue produit) ; la
+ * traduction par code permet une UI bilingue sans coupler le front aux libellés.
+ */
+function translateApiCode(code: unknown): string | null {
+  if (typeof code !== "string" || !code) return null;
+  const key = `apiErrors.${code}`;
+  return i18n.exists(key) ? i18n.t(key) : null;
+}
+
+/**
  * Construit un message d'erreur lisible depuis le corps d'une réponse non-OK.
  * Le backend renvoie `error` soit comme string, soit comme objet Zod `flatten()`
  * ({ formErrors: string[], fieldErrors: Record<string, string[]> }). Sans ce
  * traitement, un `.toString()` naïf affiche "[object Object]".
  */
 function extractError(body: unknown, status: number): string {
+  const fromCode = translateApiCode((body as { code?: unknown })?.code);
+  if (fromCode) return fromCode;
   const err = (body as { error?: unknown })?.error;
-  if (typeof err === "string" && err.trim()) return err;
+  if (typeof err === "string" && err.trim()) {
+    return translateApiCode(err) ?? err;
+  }
   if (err && typeof err === "object") {
     const zod = err as {
       formErrors?: string[];
@@ -67,6 +86,8 @@ function extractError(body: unknown, status: number): string {
     }
     if (parts.length) return parts.join(" · ");
   }
+  const msg = (body as { message?: unknown })?.message;
+  if (typeof msg === "string" && msg.trim()) return msg;
   return `HTTP ${status}`;
 }
 
@@ -89,6 +110,12 @@ async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
         ? (body as any).code
         : undefined
     const error = createApiError(message, res.status, code, body)
+
+    // 429 = rate limit : le back indique le délai avant réessai (Retry-After).
+    if (res.status === 429) {
+      const retry = Number(res.headers.get("retry-after"));
+      if (Number.isFinite(retry) && retry > 0) error.retryAfterSec = retry;
+    }
 
     // 401 avec un token présent = session expirée/invalide. On purge le token et on
     // renvoie au login (sinon React Query boucle indéfiniment sur des 401). On exclut
@@ -137,10 +164,15 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ pendingToken, code }),
     }),
+  listAuthProviders: () =>
+    req<AuthProviderPublic[]>("/api/auth/providers"),
   me: () =>
-    req<{ id: string; email: string; role: string; mfaEnabled: boolean }>(
-      "/api/auth/me",
-    ),
+    req<Me>("/api/auth/me"),
+  switchTenant: (tenantId: string) =>
+    req<{ token: string; activeTenantId: string }>("/api/auth/session/switch-tenant", {
+      method: "POST",
+      body: JSON.stringify({ tenantId }),
+    }),
   enrollMfa: () =>
     req<{ otpauth: string; secret: string }>("/api/auth/mfa/enroll", {
       method: "POST",
@@ -155,6 +187,36 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ currentPassword, newPassword }),
     }),
+  listSessions: () =>
+    req<{ sessions: { id: string; jti: string; providerId: string; createdAt: string; expiresAt: string; lastSeenAt: string; ip: string | null; userAgent: string | null; current: boolean }[] }>("/api/auth/sessions"),
+  revokeSession: (jti: string) =>
+    req<void>(`/api/auth/sessions/${jti}`, { method: "DELETE" }),
+  ldapLogin: (providerId: string, username: string, password: string) =>
+    req<{ mfaRequired: boolean; token?: string; pendingToken?: string }>(
+      `/api/auth/ldap/${encodeURIComponent(providerId)}/login`,
+      { method: "POST", body: JSON.stringify({ username, password }) },
+    ),
+  getWebauthnRegisterOptions: () =>
+    req<any>("/api/auth/mfa/webauthn/register/options", { method: "POST" }),
+  verifyWebauthnRegister: (response: any, name?: string) =>
+    req<{ verified: boolean; credentialId: string }>("/api/auth/mfa/webauthn/register/verify", {
+      method: "POST",
+      body: JSON.stringify({ response, name }),
+    }),
+  getWebauthnAuthOptions: (pendingToken?: string) =>
+    req<any>("/api/auth/mfa/webauthn/auth/options", {
+      method: "POST",
+      body: JSON.stringify({ pendingToken }),
+    }),
+  verifyWebauthnAuth: (pendingToken: string | undefined, response: any) =>
+    req<{ ok: boolean; token: string }>("/api/auth/mfa/webauthn/auth/verify", {
+      method: "POST",
+      body: JSON.stringify({ pendingToken, response }),
+    }),
+  listWebauthnCredentials: () =>
+    req<WebauthnCredentialPublic[]>("/api/auth/mfa/webauthn/credentials"),
+  deleteWebauthnCredential: (id: string) =>
+    req<void>(`/api/auth/mfa/webauthn/credentials/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   // Utilisateurs (owner uniquement)
   listUsers: () => req<UserAccount[]>("/api/users"),
@@ -174,6 +236,38 @@ export const api = {
     }),
   deleteUser: (id: string) =>
     req<{ ok: true }>(`/api/users/${id}`, { method: "DELETE" }),
+
+  // Providers d'authentification + approbations (owner uniquement).
+  listAdminProviders: () => req<AuthProviderAdmin[]>("/api/auth/admin/providers"),
+  createAdminProvider: (data: AuthProviderUpsert) =>
+    req<AuthProviderAdmin>("/api/auth/admin/providers", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  updateAdminProvider: (id: string, data: Partial<Omit<AuthProviderUpsert, "kind" | "id">>) =>
+    req<AuthProviderAdmin>(`/api/auth/admin/providers/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+  deleteAdminProvider: (id: string) =>
+    req<{ ok: true }>(`/api/auth/admin/providers/${id}`, { method: "DELETE" }),
+  testAdminProvider: (id: string) =>
+    req<ProviderTestResult>(`/api/auth/admin/providers/${id}/test`, {
+      method: "POST",
+    }),
+  listAdminPendings: () => req<PendingIdentity[]>("/api/auth/admin/pendings"),
+  approveAdminPending: (id: string, target: ApproveTarget) =>
+    req<{ ok: boolean; message: string }>(`/api/auth/admin/pendings/${id}/approve`, {
+      method: "POST",
+      body: JSON.stringify(target),
+    }),
+  rejectAdminPending: (id: string, reason?: string) =>
+    req<{ ok: boolean; message: string }>(`/api/auth/admin/pendings/${id}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    }),
+  listTenants: () =>
+    req<Tenant[]>("/api/auth/admin/tenants"),
 
   // Journal d'audit (operator+)
   audit: (
@@ -404,6 +498,31 @@ export const api = {
 
 export type Environment = "development" | "test" | "production";
 
+/** Tenants accessibles au compte (membreships) ; alimente le switcher. */
+export type MemberTenant = {
+  tenantId: string;
+  role: "owner" | "operator" | "viewer";
+  tenant: { slug: string };
+};
+
+/** Profil exposé par GET /api/auth/me : le rôle suit le tenant actif de session. */
+export type Me = {
+  id: string;
+  email: string;
+  role: "owner" | "operator" | "viewer";
+  mfaEnabled: boolean;
+  mfaRequired?: boolean;
+  activeTenantId?: string;
+  tenants?: MemberTenant[];
+};
+
+export type AuthProviderPublic = {
+  id: string;
+  kind: "oidc" | "oauth2" | "saml" | "ldap" | "local";
+  name: string;
+  enabled: boolean;
+};
+
 export type Cluster = {
   id: string;
   name: string;
@@ -417,6 +536,67 @@ export type UserAccount = {
   role: string;
   mfaEnabled: boolean;
   createdAt: string;
+};
+
+export type WebauthnCredentialPublic = {
+  id: string;
+  credentialId: string;
+  name: string | null;
+  deviceType: string | null;
+  createdAt: string;
+  lastUsedAt: string | null;
+};
+
+/** Provider vu de l'admin (owner) : config en clair SAUF champs sensibles,
+ *  masqués par marqueur par le backend (jamais la valeur du secret). */
+export type AuthProviderAdmin = {
+  id: string;
+  kind: "oidc" | "oauth2" | "saml" | "ldap" | "local";
+  name: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+};
+
+/** Marqueur de présence côté API : envoyer sur un champ sensible en PUT
+ *  signifie "conserver la valeur actuelle" (ne jamais écraser). */
+export const SECRET_MASK = "••••••••";
+
+export type AuthProviderUpsert = {
+  id?: string;
+  kind: "oidc" | "oauth2" | "saml" | "ldap";
+  name: string;
+  enabled?: boolean;
+  config: Record<string, unknown>;
+};
+
+export type ProviderTestResult = {
+  ok: boolean;
+  message?: string;
+  connectivity?: string | null;
+  details?: unknown;
+};
+
+export type PendingIdentity = {
+  id: string;
+  providerId: string;
+  issuer: string | null;
+  subject: string;
+  email: string | null;
+  name: string | null;
+  requestedForTenantId: string | null;
+  status: string;
+  createdAt: string;
+};
+
+export type Tenant = {
+  id: string;
+  name: string;
+  slug: string;
+};
+
+export type ApproveTarget = {
+  tenantId: string;
+  role: "owner" | "operator" | "viewer";
 };
 
 export type AuditEntry = {

@@ -1,5 +1,9 @@
 import { eventBus } from "../lib/event-bus"
 import { prisma } from "../lib/prisma"
+import {
+  resolveTenantIdForUser,
+  DEFAULT_TENANT_ID,
+} from "../modules/auth/identity/auth-identity.service"
 
 /**
  * Subscriber d'AUDIT centralisé : journalise les events métier dans AuditLog
@@ -19,11 +23,27 @@ const AUDITED: Record<string, string> = {
   "user.role.changed": "user.role.changed",
   "user.created": "user.created",
   "user.deleted": "user.deleted",
-  "mfa.enabled": "mfa.enabled",
+  "auth.mfa.enabled": "auth.mfa.enabled",
   "autoscale.applied": "autoscale.applied",
   "prune.finished": "prune.finished",
   "secret.set": "secret.set",
   "secret.removed": "secret.removed",
+  "auth.login.success": "auth.login.success",
+  "auth.login.failed": "auth.login.failed",
+  "auth.mfa.success": "auth.mfa.success",
+  "auth.mfa.failed": "auth.mfa.failed",
+  "auth.password.changed": "auth.password.changed",
+  "auth.saml.failed": "auth.saml.failed",
+  "auth.ldap.failed": "auth.ldap.failed",
+  "auth.webauthn.registered": "auth.webauthn.registered",
+  "auth.webauthn.deleted": "auth.webauthn.deleted",
+  // CRUD providers + approbation des identités externes.
+  "auth.provider.created": "auth.provider.created",
+  "auth.provider.updated": "auth.provider.updated",
+  "auth.provider.deleted": "auth.provider.deleted",
+  "auth.pending.created": "auth.pending.created",
+  "auth.pending.approved": "auth.pending.approved",
+  "auth.pending.rejected": "auth.pending.rejected",
 }
 
 export function registerDeploySubscribers(): void {
@@ -41,6 +61,14 @@ export function registerDeploySubscribers(): void {
       // Affiner deploy success/failed.
       const finalAction =
         eventName === "deploy.finished" ? (d.ok ? "deploy.success" : "deploy.failed") : action
+      // Tenant de l'action : explicite dans le payload si émis, sinon
+      // résolu via les membreships de l'acteur ; événements systèmes → défaut.
+      const tenantId =
+        typeof d.tenantId === "string"
+          ? d.tenantId
+          : d.userId
+            ? await resolveTenantIdForUser(d.userId)
+            : DEFAULT_TENANT_ID
       await prisma.auditLog
         .create({
           data: {
@@ -49,6 +77,7 @@ export function registerDeploySubscribers(): void {
             projectId: d.projectId ?? null,
             serverId: d.serverId ?? null,
             nodeId: d.nodeId ?? null,
+            tenantId,
             payload: { error: d.error ?? null, ...sanitize(d) },
           },
         })

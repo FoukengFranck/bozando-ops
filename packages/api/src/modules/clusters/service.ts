@@ -1,7 +1,7 @@
-import { defineConfig } from 'vite';
 import { prisma } from "../../lib/prisma";
 import { eventBus } from "../../lib/event-bus";
 import { Prisma } from "@prisma/client";
+import { DEFAULT_TENANT_ID } from "../auth/identity/auth-identity.service";
 
 export type ClusterStatus = "pending" | "ready" | "failed" | "deleting";
 
@@ -10,12 +10,22 @@ export type ClusterStatus = "pending" | "ready" | "failed" | "deleting";
  */
 
 export class ClusterService {
-  list() {
+  list(tenantId = DEFAULT_TENANT_ID) {
+    return prisma.cluster.findMany({
+      where: { tenantId },
+      orderBy: { createdAt: "asc" },
+    });
+  }
+
+  /** Tous les clusters, TOUS tenants (jobs d'arrière-plan globaux). */
+  listAll() {
     return prisma.cluster.findMany({ orderBy: { createdAt: "asc" } });
   }
 
-  get(id: string) {
-    return prisma.cluster.findUnique({ where: { id } });
+  get(id: string, tenantId?: string) {
+    return prisma.cluster.findUnique({
+      where: { id, ...(tenantId ? { tenantId } : {}) },
+    });
   }
 
   getOrThrow(id: string) {
@@ -25,9 +35,9 @@ export class ClusterService {
   /**
    * Cluster systeme est auto-crée au premier appel
    */
-  async getDefault() {
+  async getDefault(tenantId = DEFAULT_TENANT_ID) {
     const existing = await prisma.cluster.findFirst({
-      where: { isDefault: true },
+      where: { isDefault: true, tenantId },
     });
     if (existing) return existing;
     try {
@@ -38,6 +48,7 @@ export class ClusterService {
           caddyAdminUrl: process.env.CADDY_ADMIN_URL || "http://caddy:2019",
           isDefault: true,
           status: "ready",
+          tenantId,
         },
       });
     } catch (err) {
@@ -54,7 +65,7 @@ export class ClusterService {
         err.code === "P2002"
       ) {
         const winner = await prisma.cluster.findFirst({
-          where: { isDefault: true },
+          where: { isDefault: true, tenantId },
         });
         if (winner) return winner;
       }
@@ -66,8 +77,10 @@ export class ClusterService {
    * Démarrage de la creation d'un nouveau cluster-etat "pending" tant que le
    * provisioning de son 1er manager n'est pas terminé
    */
-  async createPending(name: string) {
-    const existing = await prisma.cluster.findUnique({ where: { name } });
+  async createPending(name: string, tenantId = DEFAULT_TENANT_ID) {
+    const existing = await prisma.cluster.findUnique({
+      where: { tenantId_name: { tenantId, name } },
+    });
     if (existing) {
       if (existing.status === "ready") {
         const err = new Error(
@@ -104,7 +117,7 @@ export class ClusterService {
 
     try {
       return await prisma.cluster.create({
-        data: { name, dockerHost: "", caddyAdminUrl: "", status: "pending" },
+        data: { name, dockerHost: "", caddyAdminUrl: "", status: "pending", tenantId },
       });
     } catch (err) {
       throw this.friendlyNameCollisionError(err, name);
@@ -279,11 +292,12 @@ export class ClusterService {
   async remove(
     id: string,
     opts: { teardown?: boolean } = {},
+    tenantId?: string,
   ): Promise<{
     removedServers: number;
     status: "deleted" | "deleting";
   }> {
-    const cluster = await this.get(id);
+    const cluster = await this.get(id, tenantId);
     if (!cluster) {
       const err = new Error("cluster introuvable");
       (err as Error & { statusCode?: number }).statusCode = 404;

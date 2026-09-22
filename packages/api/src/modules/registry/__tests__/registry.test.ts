@@ -87,9 +87,11 @@ describe("POST /api/registry", () => {
       "ghcr.io",
       "KamerLink",
       "ghp_abc123",
+      "tenant-default",
     );
     expect(eventBus.emit).toHaveBeenCalledWith("registry.set", {
       userId: "owner-id",
+      tenantId: "tenant-default",
       registry: "ghcr.io",
     });
   });
@@ -113,6 +115,7 @@ describe("POST /api/registry", () => {
       "ghcr.io",
       "KamerLink",
       "ghp_abc123",
+      "tenant-default",
     );
   });
     

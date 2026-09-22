@@ -132,7 +132,7 @@ export function ServersPage() {
     serversByCluster.set(srv.clusterId, arr);
   }
 
-  // Garde A5 : nombre de managers par cluster (pour masquer "Rétrograder" sur
+  // Garde : nombre de managers par cluster (pour masquer "Rétrograder" sur
   // le dernier manager — la garde backend renverrait un 409 LastManagerError).
   const managerCountByCluster = new Map<string, number>();
   for (const srv of data?.servers ?? []) {
@@ -285,7 +285,9 @@ export function ServersPage() {
       <FocusModal open={open} onOpenChange={setOpen}>
         <FocusModal.Content>
           <FocusModal.Header>
-            <Heading>Ajouter un serveur</Heading>
+            <FocusModal.Title asChild>
+              <Heading>Ajouter un serveur</Heading>
+            </FocusModal.Title>
           </FocusModal.Header>
           <FocusModal.Body className="overflow-y-auto">
             <ModalForm

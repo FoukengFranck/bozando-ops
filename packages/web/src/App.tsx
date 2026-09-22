@@ -14,6 +14,8 @@ import { MeProvider, useMe } from "./lib/useMe"
 import { ProjectsPage } from "./pages/ProjectsPage"
 import { CanvasPage } from "./pages/CanvasPage"
 import { SettingsPage } from "./pages/SettingsPage"
+import { SessionsPage } from "./pages/SessionsPage"
+import { AdminProvidersPage } from "./pages/AdminProvidersPage"
 import { ServersPage } from "./pages/ServersPage"
 import { IntegrationsPage } from "./pages/IntegrationsPage"
 import { HealthPage } from "./pages/HealthPage"
@@ -21,7 +23,6 @@ import { SecretsPage } from "./pages/SecretsPage"
 import { UpdatesPage } from "./pages/UpdatesPage"
 import { ClusterDetailPage } from "./pages/ClusterDetailPage";
 import { ClustersPage } from "./pages/ClustersPage";
-import { ResetPasswordPage } from "./pages/ResetPasswordPage";
 /**
  * Routing par URL (react-router) :
  *  - non authentifié -> /login (toutes les autres routes y redirigent)
@@ -43,7 +44,6 @@ export function App() {
           <Route path="/login" element={<Navigate to="/" replace />} />
           <Route path="/setup-domain" element={<SetupDomainPage />} />
           <Route path="/activate-mfa" element={<ActivateMfaPage />} />
-          <Route path="/reset-password" element={<ResetPasswordPage />} />
           <Route path="/canvas/:projectId" element={<CanvasPage />} />
 
           <Route element={<AppLayout onLogout={() => setAuthed(false)} />}>
@@ -55,6 +55,8 @@ export function App() {
             <Route path="/registries" element={<IntegrationsPage />} />
             <Route path="/secrets" element={<SecretsPage />} />
             <Route path="/users" element={<UsersPage />} />
+            <Route path="/providers" element={<AdminProvidersPage />} />
+            <Route path="/sessions" element={<SessionsPage />} />
             <Route path="/audit" element={<AuditPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/updates" element={<UpdatesPage />} />
@@ -79,6 +81,20 @@ function DomainGate({ children, onUnauthenticated }: { children: ReactNode; onUn
   const isProduction = envData?.environment === "production";
 
   const {
+    me,
+    isLoading: meLoading,
+    isError: meError,
+    error: meErrorObj,
+  } = useMe();
+
+  /**
+   * Le domaine public ne concerne que le owner : lui seul peut le lire/configurer
+   * (GET /api/settings/domain est owner-only). Ne pas interroger la route pour les
+   * autres rôles évite un 403 « permission insuffisante » pris à tort pour une
+   * erreur d'authentification (déconnexion des operators/viewers).
+   */
+  const isOwner = me?.role === "owner";
+  const {
     data,
     isLoading,
     isError: domainError,
@@ -87,15 +103,8 @@ function DomainGate({ children, onUnauthenticated }: { children: ReactNode; onUn
     queryKey: ["domain"],
     queryFn: () => api.getDomain(),
     staleTime: 0,
-    enabled: isProduction,
+    enabled: isProduction && isOwner,
   });
-
-  const {
-    me,
-    isLoading: meLoading,
-    isError: meError,
-    error: meErrorObj,
-  } = useMe();
 
   const isAuthError = (err: unknown) => {
     if (!err || typeof err !== "object") return false;
@@ -171,7 +180,10 @@ function DomainGate({ children, onUnauthenticated }: { children: ReactNode; onUn
 
   const hasDomain = Boolean(data?.domain);
 
-  if (me && !me.mfaEnabled && location.pathname !== "/activate-mfa") {
+  // MFA locale obligatoire : rediriger vers l'enrôlement TOTP UNIQUEMENT
+  // quand un identité locale existe et n'est pas encore enrôlée. Les
+  // utilisateurs SSO (mfaRequired=false) sont gérés par leur IdP.
+  if (me && me.mfaRequired && location.pathname !== "/activate-mfa") {
     return <Navigate to="/activate-mfa" replace />;
   }
 
@@ -179,7 +191,7 @@ function DomainGate({ children, onUnauthenticated }: { children: ReactNode; onUn
    * Le domaine n'est exigé qu'en production, en dev/test, on peut naviguer normalement sans jamais configurer
    * de domaine public. La MFA, elle, reste toujours obligatoire quel que soit l'environnement.
    */
-  if (me?.mfaEnabled && isProduction) {
+  if (isOwner && me?.mfaEnabled && isProduction) {
     if (!hasDomain && location.pathname !== "/setup-domain") {
       return <Navigate to="/setup-domain" replace />;
     }
@@ -216,11 +228,8 @@ function UnauthedGate({
     return <BootstrapPage onAuthed={onAuthed} />
   }
 
-  if (pathname !== "/login" && pathname !== "/reset-password") {
+  if (pathname !== "/login") {
     return <Navigate to="/login" replace state={{ from: pathname }} />
-  }
-  if (pathname === "/reset-password") {
-    return <ResetPasswordPage />
   }
 
   return <LoginPage onAuthed={onAuthed} />

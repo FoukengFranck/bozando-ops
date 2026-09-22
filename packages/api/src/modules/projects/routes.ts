@@ -3,6 +3,7 @@ import { z } from "zod"
 import { NodeType, EdgeKind } from "@hullbay/shared"
 import { projectsService } from "./service"
 import { requireRole } from "../auth/rbac"
+import type { TenantScopedRequest } from "../auth/tenancy/tenant-resolver"
 
 /**
  * Routes des projets - validation automatique via fastify-type-provider-zod
@@ -28,7 +29,7 @@ export async function registerProjectRoutes(app: FastifyInstance) {
       summary: "Liste des projets (viewer+)",
       security: [{ bearerAuth: []}],
     },
-  }, async () => projectsService.listProjects())
+  }, async (req) => projectsService.listProjects((req as TenantScopedRequest).tenantId))
 
   app.get("/api/projects/:id", {
     schema: {
@@ -37,7 +38,8 @@ export async function registerProjectRoutes(app: FastifyInstance) {
     }
   }, async (req, reply) => {
     const { id } = req.params as { id: string }
-    const graph = await projectsService.getProjectGraph(id)
+    const tenantId = (req as TenantScopedRequest).tenantId
+    const graph = await projectsService.getProjectGraph(id, tenantId)
     if (!graph) return reply.code(404).send({ error: "project not found" })
     return graph
   })
@@ -59,7 +61,8 @@ export async function registerProjectRoutes(app: FastifyInstance) {
     },
   }, async (req) => {
     const body = req.body as { name: string; description?: string; clusterId?: string }
-    return projectsService.createProject(body)
+    const tenantId = (req as TenantScopedRequest).tenantId
+    return projectsService.createProject({ ...body, tenantId })
   })
 
   const updateProjectBody = z.object({
@@ -76,11 +79,10 @@ export async function registerProjectRoutes(app: FastifyInstance) {
     },
   }, async (req, reply) => {
     const { id } = req.params as { id: string }
-    try {
-      return await projectsService.updateProject(id, req.body as any)
-    } catch (err) {
-      return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) })
-    }
+    const tenantId = (req as TenantScopedRequest).tenantId
+    const ok = await projectsService.updateProject(id, req.body as any, tenantId)
+    if (!ok) return reply.code(404).send({ error: "project not found" })
+    return { ok: true }
   })
 
   app.delete("/api/projects/:id", {
@@ -90,9 +92,11 @@ export async function registerProjectRoutes(app: FastifyInstance) {
       summary: "Suppression d'un projet (operator+) — audité",
       security: [{ bearerAuth: []}],
     },
-  }, async (req) => {
+  }, async (req, reply) => {
     const { id } = req.params as { id: string }
-    await projectsService.deleteProject(id)
+    const tenantId = (req as TenantScopedRequest).tenantId
+    const ok = await projectsService.deleteProject(id, tenantId)
+    if (!ok) return reply.code(404).send({ error: "project not found" })
     return { ok: true }
   })
 
@@ -114,6 +118,10 @@ export async function registerProjectRoutes(app: FastifyInstance) {
     },
   }, async (req, reply) => {
     const { id } = req.params as { id: string }
+    const tenantId = (req as TenantScopedRequest).tenantId
+    // Isolation : le projet cible doit appartenir au tenant de la requête.
+    if (!(await projectsService.getProjectGraph(id, tenantId)))
+      return reply.code(404).send({ error: "project not found" })
     try {
       const body = req.body as any
       return await projectsService.createNode({ projectId: id, ...body })
@@ -138,9 +146,12 @@ export async function registerProjectRoutes(app: FastifyInstance) {
     },
   }, async (req, reply) => {
     const { nodeId } = req.params as { nodeId: string }
+    const tenantId = (req as TenantScopedRequest).tenantId
     try {
       const body = req.body as any
-      return await projectsService.updateNode(nodeId, body)
+      const ok = await projectsService.updateNode(nodeId, body, tenantId)
+      if (!ok) return reply.code(404).send({ error: "node not found" })
+      return { ok: true }
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) })
     }
@@ -153,9 +164,11 @@ export async function registerProjectRoutes(app: FastifyInstance) {
       summary: "Suppression d'un noeud (operator+) — audité",
       security: [{ bearerAuth: []}],
     },
-  }, async (req) => {
+  }, async (req, reply) => {
     const { nodeId } = req.params as { nodeId: string }
-    await projectsService.deleteNode(nodeId)
+    const tenantId = (req as TenantScopedRequest).tenantId
+    const ok = await projectsService.deleteNode(nodeId, tenantId)
+    if (!ok) return reply.code(404).send({ error: "node not found" })
     return { ok: true }
   })
 
@@ -176,6 +189,10 @@ export async function registerProjectRoutes(app: FastifyInstance) {
     },
   }, async (req, reply) => {
     const { id } = req.params as { id: string }
+    const tenantId = (req as TenantScopedRequest).tenantId
+    // Isolation : le projet cible doit appartenir au tenant de la requête.
+    if (!(await projectsService.getProjectGraph(id, tenantId)))
+      return reply.code(404).send({ error: "project not found" })
     try {
       const body = req.body as { sourceNodeId: string; targetNodeId: string; kind: string; config?: any };
       return await projectsService.createEdge({
@@ -203,9 +220,12 @@ export async function registerProjectRoutes(app: FastifyInstance) {
     },
   }, async (req, reply) => {
     const { edgeId } = req.params as { edgeId: string }
+    const tenantId = (req as TenantScopedRequest).tenantId
     try {
       const body = req.body as any
-      return await projectsService.updateEdge(edgeId, body)
+      const ok = await projectsService.updateEdge(edgeId, body, tenantId)
+      if (!ok) return reply.code(404).send({ error: "edge not found" })
+      return { ok: true }
     } catch (err) {
       return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) })
     }
@@ -218,9 +238,11 @@ export async function registerProjectRoutes(app: FastifyInstance) {
       summary: "Suppression d'un lien (operator+) — audité",
       security: [{ bearerAuth: []}],
     },
-  }, async (req) => {
+  }, async (req, reply) => {
     const { edgeId } = req.params as { edgeId: string }
-    await projectsService.deleteEdge(edgeId)
+    const tenantId = (req as TenantScopedRequest).tenantId
+    const ok = await projectsService.deleteEdge(edgeId, tenantId)
+    if (!ok) return reply.code(404).send({ error: "edge not found" })
     return { ok: true }
   })
 }

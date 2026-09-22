@@ -12,7 +12,19 @@ import fastifySwaggerUi from "@fastify/swagger-ui";
 import { pingDocker } from "./modules/docker-engine/client";
 import { registerProjectRoutes } from "./modules/projects/routes";
 import { registerReconcilerRoutes } from "./modules/reconciler/routes";
-import { registerAuthRoutes, registerAuthGuard } from "./modules/auth/routes";
+import {
+  registerAuthRoutes,
+  registerAuthGuard,
+  registerSsoRoutes,
+  registerSamlRoutes,
+  registerProvidersRoutes,
+  registerPendingRoutes,
+  registerSessionsRoutes,
+  registerWebauthnRoutes,
+  registerLdapRoutes,
+  providerRegistry,
+  syncProviderSeedsToDb,
+} from "./modules/auth";
 import { registerRegistryRoutes } from "./modules/registry/routes";
 import { registerServersRoutes } from "./modules/servers/routes";
 import { registerObservabilityRoutes } from "./modules/observability/routes";
@@ -68,6 +80,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
           "req.body.newPassword",
           "req.body.credential",
           "req.body.privateKey",
+          "req.body.SAMLResponse",
+          "req.body.ldapPassword",
+          "req.body.bindSecret",
           "req.headers.authorization",
           "req.headers.cookie",
         ],
@@ -86,12 +101,13 @@ app.setErrorHandler((error: FastifyError, request, reply) => {
     error.validation.forEach((v) => {
       const path = v.instancePath?.replace("/", "") || "body";
       if (!fieldErrors[path]) fieldErrors[path] = [];
-      fieldErrors[path].push(v.message ?? "Une Erreur est survenue lors de la Validation");
+      fieldErrors[path].push(v.message ?? "Une erreur est survenue lors de la validation");
     });
 
     return reply.code(400).send({
       statusCode: 400,
-      error: "Validation echouee",
+      error: "Validation échouée",
+      code: "validation_failed",
       details: fieldErrors,
     });
   }
@@ -111,7 +127,7 @@ app.setErrorHandler((error: FastifyError, request, reply) => {
       info: {
         title: "hullbay API",
         description:
-          "Interface interactive pour découvrir et tester les endpoints du système.",
+          "Interactive API documentation for hullbay infrastructure ops-panel.",
         version: "1.0.0",
       },
       servers: [{ url: `http://${HOST}:${PORT}` }],
@@ -151,6 +167,13 @@ app.setErrorHandler((error: FastifyError, request, reply) => {
   // Routes métier.
   if (!skipRoutes) {
     await registerAuthRoutes(app);
+    await registerSsoRoutes(app);
+    await registerSamlRoutes(app);
+    await registerProvidersRoutes(app);
+    await registerPendingRoutes(app);
+    await registerSessionsRoutes(app);
+    await registerWebauthnRoutes(app);
+    await registerLdapRoutes(app);
     await registerSystemRoutes(app);
     await registerProjectRoutes(app);
     await registerReconcilerRoutes(app);
@@ -169,6 +192,18 @@ app.setErrorHandler((error: FastifyError, request, reply) => {
 
     // Seed du singleton SystemInfo (version courante = tag déployé via IMAGE_TAG).
     await seedSystemInfo();
+
+    // Registry des providers d'auth : AuthProvider = source de vérité.
+    // Les seeds sont synchronisées en base, puis le registre est hydraté depuis
+    // les rows (config déchiffrée, `enabled` injecté). En cas de DB indisponible
+    // on garde l'init mémoire (seeds) pour ne pas crasher le boot.
+    try {
+      await syncProviderSeedsToDb();
+      await providerRegistry.loadFromDb();
+      app.log.info("[auth] providers synchronisés + registre hydraté depuis AuthProvider");
+    } catch (err) {
+      app.log.warn(`[auth] sync providers ignorée (DB indisponible ?): ${err}`);
+    }
 
     // Reprise des mises à jour orphelines (le process meurt pendant l'update de
     // l'API lui-même — la finalisation success/failed se joue ici, au boot).

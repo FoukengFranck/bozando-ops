@@ -3,6 +3,7 @@ import { z } from "zod"
 import { registryService } from "./service"
 import { requireRole, currentUser } from "../auth/rbac"
 import { eventBus } from "../../lib/event-bus"
+import type { TenantScopedRequest } from "../auth/tenancy/tenant-resolver"
 
 /**
  * Routes du registre - validation automatique via fastify-type-provider-zod
@@ -27,7 +28,7 @@ export async function registerRegistryRoutes(app: FastifyInstance) {
         security: [{ bearerAuth: [] }],
       },
     },
-    async () => registryService.list(),
+    async (req) => registryService.list((req as TenantScopedRequest).tenantId),
   );
 
   const setBody = z.object({
@@ -53,9 +54,11 @@ export async function registerRegistryRoutes(app: FastifyInstance) {
         body.registry,
         body.username,
         body.token,
+        (req as TenantScopedRequest).tenantId,
       );
       await eventBus.emit("registry.set", {
         userId: currentUser(req)?.sub,
+        tenantId: (req as TenantScopedRequest).tenantId,
         registry: body.registry,
       });
       return { id: cred.id, registry: cred.registry, username: cred.username };
@@ -74,7 +77,7 @@ export async function registerRegistryRoutes(app: FastifyInstance) {
     },
     async (req) => {
       const { id } = req.params as { id: string };
-      await registryService.remove(id);
+      await registryService.remove(id, (req as TenantScopedRequest).tenantId);
       return { ok: true };
     },
   );

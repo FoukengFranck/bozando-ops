@@ -1,0 +1,107 @@
+/**
+ * Service identité : helpers pour la création/lookup d'identités locales
+ * et la résolution du tenant par défaut.
+ */
+
+import { prisma } from "../../../lib/prisma"
+
+/**
+ * Id littéral du tenant par défaut (créé par la migration — id fixe).
+ * Référencé par le backfill tenant-scope et le fallback d'isolation des données héritées.
+ */
+export const DEFAULT_TENANT_ID = "tenant-default"
+
+export async function ensureDefaultTenant() {
+  return prisma.tenant.upsert({
+    where: { slug: "default" },
+    create: { id: DEFAULT_TENANT_ID, name: "Default", slug: "default" },
+    update: {},
+  })
+}
+
+/**
+ * Tenant effectif de l'utilisateur : sa première membership (tenant 'default'
+ * prioritaire, sinon la plus récente). Fallback : tenant par défaut (données
+ * héritées sans membership explicite).
+ */
+export async function resolveTenantIdForUser(userId: string): Promise<string> {
+  // Prisma partiellement mocké en tests : modèle absent → tenant par défaut.
+  if (!prisma.membership?.findFirst) return DEFAULT_TENANT_ID
+  const membership = await prisma.membership.findFirst({
+    where: { userId },
+    orderBy: [{ tenant: { slug: "asc" } }, { createdAt: "desc" }],
+    select: { tenantId: true },
+  })
+  return membership?.tenantId ?? DEFAULT_TENANT_ID
+}
+
+/**
+ * Vérifie que l'utilisateur a une membership dans le tenant demandé.
+ * plus de court-circuit sur DEFAULT_TENANT_ID — le header
+ * `x-tenant-id: tenant-default` exige une membership par défaut comme n'importe
+ * quel autre tenant (sinon un owner tenant-B escaladait via le tenant par défaut).
+ * Backfill A3 garantit que les comptes hérités ont bien leur membership default.
+ */
+export async function assertUserInTenant(userId: string, tenantId: string): Promise<boolean> {
+  if (!prisma.membership?.findUnique) return true
+  const membership = await prisma.membership.findUnique({
+    where: { userId_tenantId: { userId, tenantId } },
+    select: { tenantId: true },
+  })
+  return membership !== null
+}
+
+export type ResolvedRole = "owner" | "operator" | "viewer"
+
+/**
+ * Rôle effectif de l'utilisateur : résolu depuis SA membership
+ * dans le tenant courant — le miroir `User.role` n'est plus la source de
+ * vérité (fallback legacy pour les comptes sans membership / mocks).
+ * le fallback cross-tenant (findFirst sur n'IMPORTE quelle
+ * membership) est supprimé — une résolution hors du tenant courant ne doit
+ * JAMAIS remonter un rôle d'un autre tenant (escalade tenant défaut).
+ */
+export async function resolveRoleForUser(
+  userId: string,
+  tenantId = DEFAULT_TENANT_ID,
+  fallback: string = "viewer",
+): Promise<ResolvedRole> {
+  try {
+    // Prisma partiellement mocké en tests : modèles absents → on saute l'étape.
+    if (prisma.membership?.findUnique) {
+      const membership = await prisma.membership
+        .findUnique({
+          where: { userId_tenantId: { userId, tenantId } },
+          select: { role: true },
+        })
+        .catch(() => null)
+      if (membership?.role) return membership.role as ResolvedRole
+    }
+    if (prisma.user?.findFirst) {
+      const user = await prisma.user.findFirst({ where: { id: userId } }).catch(() => null)
+      if (user?.role) return user.role as ResolvedRole
+    }
+  } catch {
+    // Mocks non-prometteurs (findFirst → undefined) : on sort vers le fallback.
+  }
+  return (fallback as ResolvedRole) || "viewer"
+}
+
+export async function findLocalIdentityByEmail(email: string) {
+  return prisma.authIdentity.findFirst({
+    where: { kind: "local", email },
+  })
+}
+
+export async function findLocalIdentityByUserId(userId: string) {
+  return prisma.authIdentity.findFirst({
+    where: { userId, kind: "local" },
+  })
+}
+
+export async function findLocalIdentityWithUser(userId: string) {
+  return prisma.authIdentity.findFirst({
+    where: { userId, kind: "local" },
+    include: { user: true },
+  })
+}

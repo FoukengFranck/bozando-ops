@@ -24,17 +24,18 @@ export class ServersService {
   } as const;
 
   /** Liste exposable au client (secrets exclus). */
-  list() {
+  list(tenantId?: string) {
     return prisma.server.findMany({
       orderBy: { createdAt: "asc" },
       select: ServersService.SAFE_SELECT,
+      ...(tenantId ? { where: { tenantId } } : {}),
     });
   }
 
   /** Récupération exposable au client (secrets exclus). */
-  get(id: string) {
+  get(id: string, tenantId?: string) {
     return prisma.server.findUnique({
-      where: { id },
+      where: { id, ...(tenantId ? { tenantId } : {}) },
       select: ServersService.SAFE_SELECT,
     });
   }
@@ -124,8 +125,11 @@ export class ServersService {
     user: string;
     role: string;
     clusterId: string;
+    tenantId: string;
   }) {
-    return prisma.server.create({ data: { ...data, status: "provisioning" } });
+    return prisma.server.create({
+      data: { ...data, status: "provisioning" },
+    });
   }
 
   update(id: string, data: Record<string, unknown>) {

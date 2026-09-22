@@ -461,8 +461,11 @@ const registryLoginStep: Step<ProvisionInput> = {
   name: "registry-login",
   run: async (input, ctx) => {
     const s = ctx.shared as ProvShared
+    // Credentials du registre scopes au tenant du serveur.
+    const cluster = await clusterService.getOrThrow(input.clusterId)
+    const tenantId = cluster.tenantId ?? undefined
     // Login pour TOUS les registres configurés (Docker Hub, GHCR, custom…).
-    const registries = await registryService.listForLogin()
+    const registries = await registryService.listForLogin(tenantId)
     if (registries.length === 0) {
       log(input.serverId, "Pas de credentials registre — étape ignorée.")
       return
@@ -565,7 +568,7 @@ export async function provisionServerWorkflow(input: ProvisionInput): Promise<vo
         try {
           await clusterService.markFailed(input.clusterId);
         } catch (markErr) {
-          // L'échec de l'update DB markFailed est déjà loggé côté service (B4).
+          // L'échec de l'update DB markFailed est déjà loggé côté service.
           // On ne masque pas l'erreur métier du provisioning ici.
           console.error(
             `[provision-server] cluster ${input.clusterId} reste en attente de statut "failed" — ${markErr instanceof Error ? markErr.message : String(markErr)}`,

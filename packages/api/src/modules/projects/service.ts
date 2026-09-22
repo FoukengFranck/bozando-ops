@@ -7,6 +7,7 @@ import {
   type ProjectGraph,
 } from "@hullbay/shared"
 import { clusterService } from "../clusters/service"
+import { DEFAULT_TENANT_ID } from "../auth/identity/auth-identity.service"
 
 /** Dérive un slug Docker-valide depuis un nom libre (sans accents, minuscules, tirets). */
 function slugify(name: string): string {
@@ -28,13 +29,16 @@ function slugify(name: string): string {
 export class ProjectsService {
   // ── Projects ──────────────────────────────────────────────────────────────
 
-  listProjects() {
-    return prisma.project.findMany({ orderBy: { updatedAt: "desc" } })
+  listProjects(tenantId = DEFAULT_TENANT_ID) {
+    return prisma.project.findMany({
+      where: { tenantId },
+      orderBy: { updatedAt: "desc" },
+    })
   }
 
-  async getProjectGraph(id: string): Promise<ProjectGraph | null> {
+  async getProjectGraph(id: string, tenantId?: string): Promise<ProjectGraph | null> {
     const project = await prisma.project.findUnique({
-      where: { id },
+      where: { id, ...(tenantId ? { tenantId } : {}) },
       include: { nodes: true, edges: true },
     })
     if (!project) return null
@@ -46,23 +50,44 @@ export class ProjectsService {
    * garantir l'unicité (le slug préfixe les noms Docker, donc doit être unique).
    * Ex: "Boutique Prod" -> "boutique-prod-a3f8".
    */
-  async createProject(input: { name: string; description?: string; clusterId?: string }) {
+  async createProject(input: { name: string; description?: string; clusterId?: string; tenantId?: string }) {
+    const tenantId = input.tenantId ?? DEFAULT_TENANT_ID
     const slug = `${slugify(input.name) || "projet"}-${randomBytes(2).toString("hex")}`
-    const targetClusterId = input.clusterId ?? (await clusterService.getDefault()).id
+    // Si un cluster est fourni, il DOIT appartenir au tenant —
+    // sinon le projet serait créé sur le cluster d'un AUTRE tenant (fuite d'IDs).
+    let targetClusterId = input.clusterId
+    if (targetClusterId) {
+      const cluster = await clusterService.get(targetClusterId, tenantId)
+      if (!cluster) {
+        const err = new Error("cluster introuvable") as Error & { statusCode?: number }
+        err.statusCode = 404
+        throw err
+      }
+    } else {
+      targetClusterId = (await clusterService.getDefault(tenantId)).id
+    }
     return prisma.project.create({
-      data: { name: input.name, slug, description: input.description, clusterId: targetClusterId },
+      data: { name: input.name, slug, description: input.description, clusterId: targetClusterId, tenantId },
     })
   }
 
-  updateProject(
+  async updateProject(
     id: string,
-    data: Partial<{ name: string; description: string; status: string }>
+    data: Partial<{ name: string; description: string; status: string }>,
+    tenantId?: string
   ) {
-    return prisma.project.update({ where: { id }, data })
+    const res = await prisma.project.updateMany({
+      where: { id, ...(tenantId ? { tenantId } : {}) },
+      data,
+    })
+    return res.count > 0
   }
 
-  deleteProject(id: string) {
-    return prisma.project.delete({ where: { id } })
+  async deleteProject(id: string, tenantId?: string) {
+    const res = await prisma.project.deleteMany({
+      where: { id, ...(tenantId ? { tenantId } : {}) },
+    })
+    return res.count > 0
   }
 
   // ── Nodes ─────────────────────────────────────────────────────────────────
@@ -91,16 +116,19 @@ export class ProjectsService {
 
   async updateNode(
     id: string,
-    data: Partial<{ name: string; posX: number; posY: number; config: unknown }>
+    data: Partial<{ name: string; posX: number; posY: number; config: unknown }>,
+    tenantId?: string
   ) {
+    const scopedWhere = { id, ...(tenantId ? { project: { tenantId } } : {}) }
     // Si la config change, la revalider selon le type courant du nœud.
     let configToSave: object | undefined
     if (data.config !== undefined) {
-      const node = await prisma.node.findUniqueOrThrow({ where: { id } })
+      const node = await prisma.node.findUnique({ where: scopedWhere })
+      if (!node) return false
       configToSave = parseNodeConfig(node.type as NodeType, data.config) as object
     }
-    return prisma.node.update({
-      where: { id },
+    const res = await prisma.node.updateMany({
+      where: scopedWhere,
       data: {
         name: data.name,
         posX: data.posX,
@@ -108,10 +136,14 @@ export class ProjectsService {
         ...(configToSave !== undefined ? { config: configToSave } : {}),
       },
     })
+    return res.count > 0
   }
 
-  deleteNode(id: string) {
-    return prisma.node.delete({ where: { id } })
+  async deleteNode(id: string, tenantId?: string) {
+    const res = await prisma.node.deleteMany({
+      where: { id, ...(tenantId ? { project: { tenantId } } : {}) },
+    })
+    return res.count > 0
   }
 
   // ── Edges ─────────────────────────────────────────────────────────────────
@@ -180,12 +212,19 @@ export class ProjectsService {
     return node.type as NodeType
   }
 
-  updateEdge(id: string, data: { config?: object | null }) {
-    return prisma.edge.update({ where: { id }, data: { config: data.config ?? undefined } })
+  async updateEdge(id: string, data: { config?: object | null }, tenantId?: string) {
+    const res = await prisma.edge.updateMany({
+      where: { id, ...(tenantId ? { project: { tenantId } } : {}) },
+      data: { config: data.config ?? undefined },
+    })
+    return res.count > 0
   }
 
-  deleteEdge(id: string) {
-    return prisma.edge.delete({ where: { id } })
+  async deleteEdge(id: string, tenantId?: string) {
+    const res = await prisma.edge.deleteMany({
+      where: { id, ...(tenantId ? { project: { tenantId } } : {}) },
+    })
+    return res.count > 0
   }
 }
 

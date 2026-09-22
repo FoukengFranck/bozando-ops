@@ -1,0 +1,143 @@
+/**
+ * Routes d'authentification LDAP / LDAPS.
+ */
+
+import type { FastifyInstance, FastifyReply } from "fastify"
+import { z } from "zod"
+import { providerRegistry } from "../registry/provider-registry"
+import { sessionManager } from "../core/session-manager"
+import { resolveRoleForUser, resolveTenantIdForUser } from "../identity/auth-identity.service"
+import { userHasMfaFactor } from "../core/auth-core"
+import { eventBus } from "../../../lib/event-bus"
+import { AUTH_AUDIT_EVENTS } from "../audit-events"
+import { authRateLimiter, rateLimitTenant } from "../rate-limit"
+import { IdentityPendingError } from "../core/identity-mapping"
+import { AuthError } from "../providers/types"
+
+function serializeError(err: unknown, fallbackStatus = 400) {
+  const message = err instanceof Error ? err.message : String(err)
+  const code =
+    err && typeof err === "object" && "code" in err && typeof (err as { code?: unknown }).code === "string"
+      ? (err as { code: string }).code
+      : undefined
+  // Un AuthError porte son propre status (401, 403…) ; on ne le remplace pas par
+  // le fallback, sinon un 403 serait rapporté à tort comme un 401.
+  const status =
+    err && typeof err === "object" && typeof (err as { status?: unknown }).status === "number"
+      ? (err as { status: number }).status
+      : fallbackStatus
+
+  const payload: { error: string; code?: string } = { error: message }
+  if (code) payload.code = code
+
+  return { status, payload }
+}
+
+function rateLimited(reply: FastifyReply, retryAfterSec: number) {
+  return reply
+    .code(429)
+    .header("retry-after", String(retryAfterSec))
+    .send({
+      error: "trop de tentatives, réessayez dans quelques secondes",
+      code: "rate_limited",
+    })
+}
+
+function traceLdapFailed(providerId: string, username: string, code: string | undefined): void {
+  void eventBus
+    .emit(AUTH_AUDIT_EVENTS.ldapFailed, { providerId, username, reason: code ?? "invalid_credentials" })
+    .catch(() => {})
+}
+
+export async function registerLdapRoutes(app: FastifyInstance) {
+  const loginBody = z.object({
+    username: z.string().min(1),
+    password: z.string().min(1),
+  })
+
+  app.post(
+    "/api/auth/ldap/:id/login",
+    {
+      schema: {
+        body: loginBody,
+        tags: ["auth"],
+        summary: "Connexion via un provider LDAP / LDAPS",
+      },
+    },
+    async (req, reply) => {
+      const { id } = req.params as { id: string }
+      const body = req.body as { username: string; password: string }
+
+      const key = authRateLimiter.keyFor(req.ip, `/api/auth/ldap/${id}/login`, body.username, rateLimitTenant(req))
+      const before = authRateLimiter.check(key, rateLimitTenant(req))
+      if (before.blocked) return rateLimited(reply, before.retryAfterSec ?? 1)
+
+      try {
+        // Pas de `require()` : son message interne (FR) ne doit jamais fuiter tel
+        // quel. On répond un 404 uniforme (même anti-énumération que les SSO).
+        const provider = providerRegistry.get(id)
+        if (!provider || provider.kind !== "ldap" || !provider.enabled) {
+          return reply.code(404).send({ error: "provider LDAP introuvable ou désactivé", code: "provider_not_found" })
+        }
+
+        const result = await provider.authenticate({
+          kind: "ldap",
+          ldapUsername: body.username,
+          ldapPassword: body.password,
+        })
+
+        authRateLimiter.reset(key, rateLimitTenant(req))
+
+        // Audit de succès au niveau credentials (miroir des logins local/SSO) :
+        // la décision MFA qui suit est un état intermédiaire, pas un échec.
+        void eventBus
+          .emit(AUTH_AUDIT_EVENTS.loginSuccess, { providerId: id, userId: result.userId, method: "ldap" })
+          .catch(() => {})
+
+        // Politique MFA : par défaut l'IdP fournit la 2e MFA (comme les SSO), donc
+        // la session est valide. Si la politique exige une MFA locale :
+        //  - un facteur est déjà enrôlé → token pending, vérification TOTP/WebAuthn ;
+        //  - aucun facteur → session "setup" (mfaEnabled=false) : la garde limite
+        //    l'accès aux routes d'enrôlement et /me force l'activation.
+        if (result.mfaRequired) {
+          if (await userHasMfaFactor(result.userId)) {
+            return {
+              mfaRequired: true as const,
+              pendingToken: sessionManager.signPending(result.userId),
+            }
+          }
+          const tenantId = await resolveTenantIdForUser(result.userId)
+          const role = await resolveRoleForUser(result.userId, tenantId, result.role)
+          return {
+            mfaRequired: false as const,
+            token: sessionManager.signSession(result.userId, role, false, id, tenantId),
+          }
+        }
+
+        const tenantId = await resolveTenantIdForUser(result.userId)
+        const role = await resolveRoleForUser(result.userId, tenantId, result.role)
+        return {
+          mfaRequired: false as const,
+          token: sessionManager.signSession(result.userId, role, true, id, tenantId),
+        }
+      } catch (err) {
+        authRateLimiter.recordFailure(key, rateLimitTenant(req))
+
+        if (err instanceof IdentityPendingError) {
+          return reply.code(403).send({
+            error: "Cette identité est en attente d'approbation par un administrateur.",
+            code: "identity_pending_approval",
+          })
+        }
+
+        const { status, payload } = serializeError(err, 401)
+        // C4 : la cause machine (AuthError.reason, ex. account_disabled_or_locked)
+        // alimente l'audit ldapFailed ; elle n'apparaît jamais dans le payload
+        // renvoyé au client (message uniforme "identifiants invalides").
+        const reason = err instanceof AuthError ? err.reason : undefined
+        traceLdapFailed(id, body.username, reason ?? payload.code)
+        return reply.code(status).send(payload)
+      }
+    },
+  )
+}

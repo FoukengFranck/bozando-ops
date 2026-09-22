@@ -1,6 +1,6 @@
-import { useState } from "react"
-import { useNavigate } from "react-router-dom"
-import { api, auth } from "../lib/api"
+import { useEffect, useState } from "react"
+import { useNavigate, useSearchParams } from "react-router-dom"
+import { api, auth, type ApiError, type AuthProviderPublic } from "../lib/api"
 import {
   Button,
   Heading,
@@ -10,16 +10,73 @@ import {
   toast,
 } from "@medusajs/ui"
 import { useTranslation } from "react-i18next"
+import { getWebauthnAssertion } from "../lib/webauthn-client"
 
 export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
   const { t } = useTranslation()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
 
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [pendingToken, setPendingToken] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [code, setCode] = useState("")
+
+  // SSO : providers activés (rendu après mount pour ne pas bloquer le login local)
+  const [ssoProviders, setSsoProviders] = useState<AuthProviderPublic[] | null>(null)
+  // Bannière "identité en attente d'approbation" (callback → /login?pending=1)
+  const wasPending = searchParams.get("pending") === "1"
+  const pendingEmail = searchParams.get("email") ?? ""
+  const ssoError = searchParams.get("error") ?? ""
+
+  // Prefetch passe par le hook useEffect : le module reste SSR-compatible.
+  useEffect(() => {
+    let cancelled = false
+    api
+      .listAuthProviders()
+      .then((providers) => {
+        if (!cancelled) {
+          setSsoProviders(providers.filter((p) => p.kind === "oidc" || p.kind === "oauth2" || p.kind === "saml" || p.kind === "ldap"))
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSsoProviders([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (ssoError) {
+      toast.error(t("auth.sso.failed"), { description: ssoError })
+    }
+  }, [ssoError, t])
+
+  // Verrouillage temporaire après abus de tentatives (429 du back).
+  const [lockedUntil, setLockedUntil] = useState<number | null>(null)
+  const [nowTick, setNowTick] = useState(() => Date.now())
+
+  const remainingSec =
+    lockedUntil !== null ? Math.max(0, Math.ceil((lockedUntil - nowTick) / 1000)) : 0
+
+  useEffect(() => {
+    if (lockedUntil === null) return
+    const id = setInterval(() => setNowTick(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [lockedUntil])
+
+  useEffect(() => {
+    if (lockedUntil !== null && Date.now() >= lockedUntil) {
+      setLockedUntil(null)
+      toast.info(t("auth.rateLimited.unlocked"))
+    }
+  }, [nowTick, lockedUntil, t])
+
+  function lock(err: ApiError) {
+    setLockedUntil(Date.now() + (err.retryAfterSec ?? 30) * 1000)
+  }
 
   async function submitCredentials() {
     setLoading(true)
@@ -38,11 +95,16 @@ export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
         navigate("/", { replace: true })
       }
     } catch (e) {
-      const err = e as Error & { code?: string }
+      const err = e as ApiError
+
+      if (err.status === 429) {
+        lock(err)
+        return
+      }
 
       if (err.code === "invalid_credentials") {
         toast.error(t("auth.toast.loginFailed"), {
-          description: "Email ou mot de passe incorrect.",
+          description: t("auth.toast.invalidCredentialsDescription"),
         })
       } else {
         toast.error(t("auth.toast.loginFailed"), {
@@ -66,14 +128,19 @@ export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
       onAuthed()
       navigate("/", { replace: true })
     } catch (e) {
-      const err = e as Error & { code?: string }
+      const err = e as ApiError
+
+      if (err.status === 429) {
+        lock(err)
+        return
+      }
 
       if (
         err.code === "mfa_code_invalid" ||
         err.code === "mfa_token_invalid"
       ) {
         toast.error(t("auth.toast.invalidCode"), {
-          description: "Le code MFA est incorrect ou expiré.",
+          description: t("auth.toast.invalidMfaDescription"),
         })
       } else {
         toast.error(t("auth.toast.invalidCode"), {
@@ -85,16 +152,96 @@ export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
     }
   }
 
+  const [selectedLdap, setSelectedLdap] = useState<AuthProviderPublic | null>(null)
+  const [ldapUsername, setLdapUsername] = useState("")
+  const [ldapPassword, setLdapPassword] = useState("")
+
+  async function submitLdapCredentials() {
+    if (!selectedLdap) return
+    setLoading(true)
+    try {
+      const res = await api.ldapLogin(selectedLdap.id, ldapUsername, ldapPassword)
+      if (res.mfaRequired && res.pendingToken) {
+        setPendingToken(res.pendingToken)
+        return
+      }
+      if (res.token) {
+        auth.set(res.token)
+        onAuthed()
+        navigate("/", { replace: true })
+      }
+    } catch (e) {
+      const err = e as ApiError
+      if (err.status === 429) {
+        lock(err)
+        return
+      }
+      if (err.code === "identity_pending_approval") {
+        toast.info(t("auth.sso.pending.title"), {
+          description: t("auth.sso.pending.description", { email: ldapUsername }),
+        })
+      } else if (err.code === "invalid_credentials") {
+        toast.error(t("auth.toast.loginFailed"), {
+          description: t("auth.toast.invalidCredentialsDescription"),
+        })
+      } else if (err.code === "provider_not_found") {
+        toast.error(t("auth.toast.loginFailed"), {
+          description: t("auth.ldap.providerNotFound"),
+        })
+      } else {
+        toast.error(t("auth.toast.loginFailed"), { description: err.message })
+      }
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function submitWebauthn() {
+    if (!pendingToken) return
+    setLoading(true)
+    try {
+      const options = await api.getWebauthnAuthOptions(pendingToken)
+      const assertion = await getWebauthnAssertion(options)
+      const res = await api.verifyWebauthnAuth(pendingToken, assertion)
+      if (res.token) {
+        auth.set(res.token)
+        onAuthed()
+        navigate("/", { replace: true })
+      }
+    } catch (e) {
+      const err = e as ApiError & { code?: string }
+      if (err.status === 429) {
+        lock(err)
+        return
+      }
+      const description =
+        err.code === "not_supported"
+          ? t("auth.webauthn.notSupported")
+          : err.code === "cancelled"
+            ? t("auth.webauthn.cancelled")
+            : err.code === "mfa_not_configured"
+              ? t("auth.webauthn.noCredentials")
+              : err.code === "mfa_code_invalid"
+              ? t("auth.toast.invalidMfaDescription")
+              : err.code === "mfa_token_invalid"
+                ? t("auth.webauthn.challengeExpired")
+                : err.code === "session_invalid"
+                  ? t("auth.webauthn.sessionInvalid")
+                  : err.message
+      toast.error(t("auth.webauthn.authFailed"), { description })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const lockVisible = remainingSec > 0;
+  const disabled = loading || lockVisible;
+
   return (
   <div className="flex min-h-full w-full items-center justify-center bg-ui-bg-subtle px-4 py-8">
     <div className="w-full max-w-[390px]">
 
-      {/* Logo */}
-      <div className="mb-6 flex justify-center">
-        <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-ui-bg-base shadow-sm">
-          <div className="h-7 w-7 rounded-lg bg-ui-fg-base" />
-        </div>
-      </div>
+
 
       {/* Header */}
       <div className="mb-6 text-center">
@@ -110,7 +257,93 @@ export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
         </Text>
       </div>
 
-      {!pendingToken ? (
+      {lockVisible && (
+        <div
+          role="alert"
+          aria-live="polite"
+          className="mb-5 rounded-xl border border-ui-border-error bg-ui-bg-error px-4 py-3"
+        >
+          <Text className="text-sm font-medium leading-5 text-ui-fg-error">
+            {t("auth.rateLimited.title")}
+          </Text>
+          <Text className="mt-0.5 text-sm leading-5 text-ui-fg-error">
+            {t("auth.rateLimited.retryIn", { seconds: remainingSec })}
+          </Text>
+        </div>
+      )}
+
+      {/* Pending SSO : identité externe en attente d'approbation */}
+      {wasPending && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="mb-5 rounded-xl border border-ui-border-base bg-ui-bg-base px-4 py-3"
+        >
+          <Text className="text-sm font-medium leading-5 text-ui-fg-base">
+            {t("auth.sso.pending.title")}
+          </Text>
+          <Text className="mt-0.5 text-sm leading-5 text-ui-fg-subtle">
+            {t("auth.sso.pending.description", { email: pendingEmail || "—" })}
+          </Text>
+        </div>
+      )}
+
+      {selectedLdap ? (
+        <div className="flex flex-col gap-4">
+          <div className="mb-1">
+            <Heading level="h2" className="text-base font-semibold text-ui-fg-base">
+              {t("auth.ldap.title", { name: selectedLdap.name })}
+            </Heading>
+            <Text className="text-sm text-ui-fg-subtle">
+              {t("auth.ldap.subtitle")}
+            </Text>
+          </div>
+
+          <div>
+            <Label size="small" className="mb-1.5 block text-ui-fg-subtle">
+              {t("auth.ldap.usernameLabel")}
+            </Label>
+            <Input
+              value={ldapUsername}
+              onChange={(e) => setLdapUsername(e.target.value)}
+              placeholder={t("auth.ldap.usernamePlaceholder")}
+              disabled={disabled}
+              className="h-10 rounded-lg disabled:opacity-50"
+            />
+          </div>
+
+          <div>
+            <Label size="small" className="mb-1.5 block text-ui-fg-subtle">
+              {t("auth.login.passwordLabel")}
+            </Label>
+            <Input
+              type="password"
+              value={ldapPassword}
+              onChange={(e) => setLdapPassword(e.target.value)}
+              disabled={disabled}
+              className="h-10 rounded-lg disabled:opacity-50"
+            />
+          </div>
+
+          <Button
+            onClick={submitLdapCredentials}
+            isLoading={loading}
+            disabled={disabled}
+            className="mt-1 h-10 w-full rounded-lg disabled:opacity-50"
+          >
+            {t("auth.ldap.submitButton")}
+          </Button>
+
+          <Button
+            variant="secondary"
+            onClick={() => setSelectedLdap(null)}
+            disabled={disabled}
+            className="h-10 w-full rounded-lg disabled:opacity-50"
+          >
+            {t("auth.ldap.backToLocal")}
+          </Button>
+        </div>
+      ) : !pendingToken ? (
         <div className="flex flex-col gap-4">
 
           {/* Email */}
@@ -127,7 +360,8 @@ export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder={t("auth.login.placeholder")}
-              className="h-10 rounded-lg"
+              disabled={disabled}
+              className="h-10 rounded-lg disabled:opacity-50"
             />
           </div>
 
@@ -144,7 +378,8 @@ export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="h-10 rounded-lg"
+              disabled={disabled}
+              className="h-10 rounded-lg disabled:opacity-50"
             />
           </div>
 
@@ -152,32 +387,47 @@ export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
           <Button
             onClick={submitCredentials}
             isLoading={loading}
-            className="mt-1 h-10 w-full rounded-lg"
+            disabled={disabled}
+            className="mt-1 h-10 w-full rounded-lg disabled:opacity-50"
           >
             {t("auth.login.submitButton")}
           </Button>
 
-          {/* Secondary actions */}
-          <div className="mt-2 flex flex-col items-center gap-2 text-sm">
-            <div className="text-ui-fg-subtle">
-              <span>Mot de passe oublié ? </span>
-              <span
-                className="cursor-pointer text-ui-fg-interactive"
-                onClick={() => navigate("/reset-password")}>
-                Initialiser le mot de passe
-              </span>
-            </div>
+          {/* SSO : boutons vers les providers OIDC/OAuth2/SAML/LDAP activés */}
+          {ssoProviders && ssoProviders.length > 0 && (
+            <>
+              <div className="flex items-center gap-3">
+                <div className="h-px flex-1 bg-ui-border-base" />
+                <Text className="text-xs uppercase tracking-wide text-ui-fg-muted">
+                  {t("auth.sso.orContinueWithLocal")}
+                </Text>
+                <div className="h-px flex-1 bg-ui-border-base" />
+              </div>
 
-            <div className="text-ui-fg-subtle">
-              <span>Pas encore de compte ? </span>
-              <span
-                className="cursor-pointer text-ui-fg-interactive"
-                onClick={() => alert("La creation de compte est actuellementdesactivee.")}>
-                Créer un compte
-              </span>
-            </div>
+              <div className="flex flex-col gap-2">
+                {ssoProviders.map((p) => (
+                  <Button
+                    key={p.id}
+                    variant="secondary"
+                    onClick={() => {
+                      if (p.kind === "ldap") {
+                        setSelectedLdap(p)
+                      } else {
+                        const base = p.kind === "saml" ? "/api/auth/saml" : "/api/auth/sso"
+                        window.location.href = `${base}/${encodeURIComponent(p.id)}/login`
+                      }
+                    }}
+                    disabled={disabled}
+                    className="h-10 w-full rounded-lg disabled:opacity-50"
+                  >
+                    {t("auth.sso.signInWith", { name: p.name })}
+                  </Button>
+                ))}
+              </div>
+            </>
+          )}
+
           </div>
-        </div>
       ) : (
         <div className="flex flex-col gap-4">
 
@@ -187,7 +437,7 @@ export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
               size="small"
               className="mb-1.5 block text-ui-fg-subtle"
             >
-              Code de vérification
+              {t("auth.mfa.codeLabel")}
             </Label>
 
             <Input
@@ -195,16 +445,36 @@ export function LoginPage({ onAuthed }: { onAuthed: () => void }) {
               onChange={(e) => setCode(e.target.value)}
               placeholder={t("auth.mfa.codePlaceholder")}
               inputMode="numeric"
-              className="h-10 rounded-lg text-center tracking-[0.25em]"
+              disabled={disabled}
+              className="h-10 rounded-lg text-center tracking-[0.25em] disabled:opacity-50"
             />
           </div>
 
           <Button
             onClick={submitMfa}
             isLoading={loading}
-            className="h-10 w-full rounded-lg"
+            disabled={disabled}
+            className="h-10 w-full rounded-lg disabled:opacity-50"
           >
             {t("auth.mfa.submitButton")}
+          </Button>
+
+          <div className="flex items-center gap-3">
+            <div className="h-px flex-1 bg-ui-border-base" />
+            <Text className="text-xs uppercase tracking-wide text-ui-fg-muted">
+              {t("auth.mfa.orWebauthn")}
+            </Text>
+            <div className="h-px flex-1 bg-ui-border-base" />
+          </div>
+
+          <Button
+            variant="secondary"
+            onClick={submitWebauthn}
+            isLoading={loading}
+            disabled={disabled}
+            className="h-10 w-full rounded-lg disabled:opacity-50"
+          >
+            {t("auth.mfa.webauthnButton")}
           </Button>
         </div>
       )}
